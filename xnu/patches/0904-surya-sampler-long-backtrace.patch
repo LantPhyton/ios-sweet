@@ -18,9 +18,21 @@ to it.
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1014,32 +1015,111 @@
+@@ -1011,35 +1012,123 @@
+ 	}
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
+ 
++	/* surya 23.10: sweetsamplet0=1 samples only the first (main) thread */
++	static int only_t0 = -1;
++	if (only_t0 < 0) {
++		only_t0 = 0;
++		(void)PE_parse_boot_argn("sweetsamplet0", &only_t0, sizeof(only_t0));
++	}
  	task_lock(task);
  	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		if (only_t0 && tn > 0) {
++			break;
++		}
  		arm_saved_state_t *ss = find_user_regs(thread);
 -		char line[400];
 -		int n;
