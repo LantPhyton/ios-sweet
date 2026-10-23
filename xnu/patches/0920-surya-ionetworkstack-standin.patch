@@ -2,6 +2,83 @@ surya: IONetworkStack stand-in
 
 From sashinovsky/ios-bittery 364c7efa43 (confirmed on Pixel 3; qcom-toolbox
 0111: the first process that lists interfaces no longer waits 300 s).
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -0,0 +1,74 @@
++/*
++ * Stand-in IONetworkStack for SWEET.
++ *
++ * IONetworkStack belongs to IONetworkingFamily (closed source, not in this
++ * kernel). configd's InterfaceNamer opens it before it publishes "IOKit
++ * quiet" (configd-1241 ifnamer.c quietCallback returns early without the
++ * stack connection), and SCNetworkInterfaceCopyAll waits for that, or for
++ * InterfaceNamer's WaitStackTimeout (300 s): Settings > About froze on it.
++ *
++ * There is no IONetworkInterface to name yet, so naming requests
++ * (IOConnectSetCFProperties with IONetworkStackUserCommand) are accepted,
++ * logged once and ignored.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class IONetworkStack : public IOService {
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetNetworkStackUserClient");
++	registerService();
++	IOLog("SWEET NETSTACK: IONetworkStack stand-in registered\n");
++	return true;
++}
++
++class SweetNetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetNetworkStackUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetNetworkStackUserClient, IOUserClient);
++
++IOReturn
++SweetNetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static bool sweet_netstack_logged;
++
++IOReturn
++SweetNetworkStackUserClient::setProperties(__unused OSObject *properties)
++{
++	if (!sweet_netstack_logged) {
++		sweet_netstack_logged = true;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET NETSTACK: %s naming request ignored (no IONetworkInterface)\n", name);
++	}
++	return kIOReturnSuccess;
++}
++#endif /* SWEET */
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
 @@ -58,6 +58,11 @@ const char * gIOKernelConfigTables =
