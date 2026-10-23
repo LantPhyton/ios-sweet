@@ -10,7 +10,16 @@ processors, and one processor's PMCCNTR_EL0 against CNTVCT_EL0 while bound
 to it.
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -823,6 +823,8 @@
+@@ -86,6 +86,8 @@
+ #include <kern/misc_protos.h>
+ #include <kern/ux_handler.h>
+ #include <kern/task_ident.h>
++#include <kern/cpu_number.h>
++extern int proc_threadname_kdp(void *uth, char *buf, size_t size); /* bsd/kern/kern_proc.c */
+ 
+ #include <vm/vm_map.h>
+ 
+@@ -823,6 +825,8 @@
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <vm/vm_shared_region.h>
  #include <arm/thread.h>
@@ -19,7 +28,7 @@ to it.
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1011,35 +1013,131 @@
+@@ -1011,35 +1015,191 @@
  	}
  	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
  
@@ -56,9 +65,21 @@ to it.
 +		struct recount_times_mach rtm = recount_thread_times(thread);
 +		absolutetime_to_nanoseconds(rtm.rtm_user, &ut);
 +		absolutetime_to_nanoseconds(rtm.rtm_system, &st);
-+		printf("SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx cpu u=%llu s=%llu\n", name, t,
++		/* surya 23.10: who the thread is (tid, name), how it is scheduled
++		 * (priority, mode: 1 realtime, 2 fixed, 3 timeshare) and where it
++		 * last ran (cpu 0-5 Cortex-A55, 6-7 Cortex-A76). */
++		char tname[64];                 /* MAXTHREADNAMESIZE (bsd/sys/user.h) */
++		tname[0] = '\0';
++		(void)proc_threadname_kdp(get_bsdthread_info(thread), tname, sizeof(tname));
++		tname[sizeof(tname) - 1] = '\0';
++		processor_t lp = thread->last_processor;
++		processor_t bp = thread->bound_processor;
++		printf("SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx cpu u=%llu s=%llu tid %llu pri %d/%d mode %d on %d bound %d name %s\n", name, t,
 +		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss),
-+		    (unsigned long long)ut, (unsigned long long)st);
++		    (unsigned long long)ut, (unsigned long long)st,
++		    (unsigned long long)thread_tid(thread), thread->sched_pri, thread->base_pri,
++		    (int)thread->sched_mode, lp ? lp->cpu_id : -1, bp ? bp->cpu_id : -1,
++		    tname[0] ? tname : "-");
 +		/*
 +		 * surya: the live USB log cuts lines near 250 bytes, which hid the
 +		 * callers. Up to 64 frames, 8 per line: "SMP name tN bt+K ...".
@@ -118,6 +139,54 @@ to it.
 +		}
 +	}
 +	return mask;
++}
++
++/*
++ * surya 23.10: suryabig=N binds the thread that hands frames to the panel
++ * (SwapEnd from backboardd: CoreAnimation's render thread, which also
++ * rasterises in software, CA::OGL::SW) to cpu N. All eight cores sit in one
++ * cluster in this kernel, so the scheduler does not tell the Cortex-A76
++ * cores (6, 7) from the Cortex-A55 ones (0-5) and the render thread may run
++ * on a core of a third of the speed. thread_bind asserts a non-realtime
++ * priority, so a realtime thread is only reported.
++ */
++static int surya_big_cpu = -2;          /* -2 not parsed, -1 off */
++
++void surya_bind_render_thread(void);
++
++void
++surya_bind_render_thread(void)
++{
++	thread_t th = current_thread();
++	static int reported;
++
++	if (surya_big_cpu == -2) {
++		int v = -1;
++		if (!PE_parse_boot_argn("suryabig", &v, sizeof(v)) || v < 0 || v > 7) {
++			v = -1;
++		}
++		surya_big_cpu = v;
++	}
++	if (surya_big_cpu < 0 || th->bound_processor != PROCESSOR_NULL) {
++		return;
++	}
++	if (th->sched_mode == TH_MODE_REALTIME || th->sched_pri >= BASEPRI_RTQUEUES) {
++		if (reported++ < 3) {
++			printf("SURYA BIG: frame thread %llu is realtime (pri %d mode %d), not bound\n",
++			    (unsigned long long)thread_tid(th), th->sched_pri, (int)th->sched_mode);
++		}
++		return;
++	}
++	processor_t p = cpu_to_processor(surya_big_cpu);
++	if (p == PROCESSOR_NULL) {
++		return;
++	}
++	int from = th->last_processor ? th->last_processor->cpu_id : -1;
++	(void)thread_bind(p);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++	printf("SURYA BIG: frame thread %llu (pri %d mode %d) bound to cpu %d, was on cpu %d, now on cpu %d\n",
++	    (unsigned long long)thread_tid(th), th->sched_pri, (int)th->sched_mode, surya_big_cpu, from,
++	    cpu_number());
 +}
 +
 +int
