@@ -1,0 +1,67 @@
+surya: mirror chosen processes' os_log to the live log
+
+Boot-arg sweetoslog=name,... adds OS_ACTIVITY_DT_MODE=YES (and with
+sweetoslog_debug=1 OS_ACTIVITY_MODE=debug) to the environment of those
+executables at exec, so libsystem_trace copies their os_log messages to
+stderr; sweetnull= forwards that to the console and the USB live log.
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5741,6 +5741,58 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * surya 23.10: boot-arg sweetoslog=name,name,... gives the processes
++	 * whose executable has that name OS_ACTIVITY_DT_MODE=YES (and, with
++	 * sweetoslog_debug=1, OS_ACTIVITY_MODE=debug): libsystem_trace then
++	 * mirrors their os_log messages to stderr, which launchd points at
++	 * /dev/null, and sweetnull= (bsd/dev/mem.c) passes that on to the live
++	 * log. The unified log is otherwise only readable on the phone itself.
++	 */
++	{
++		static char names[256];
++		static int parsed, debug;
++		if (!parsed) {
++			if (!PE_parse_boot_argn("sweetoslog", names, sizeof(names))) {
++				names[0] = '\0';
++			}
++			(void)PE_parse_boot_argn("sweetoslog_debug", &debug, sizeof(debug));
++			parsed = 1;
++		}
++		const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
++		const char *base = strrchr(path, '/');
++		base = base ? base + 1 : path;
++		size_t n = strlen(base);
++		bool want = false;
++		for (const char *t = names; *t && n > 0;) {
++			const char *end = strchr(t, ',');
++			size_t tl = end ? (size_t)(end - t) : strlen(t);
++			if ((tl == n && strncmp(t, base, n) == 0) || (tl == 1 && *t == '*')) {
++				want = true;
++				break;
++			}
++			if (!end) {
++				break;
++			}
++			t = end + 1;
++		}
++		static const char *const vars[2] = { "OS_ACTIVITY_DT_MODE=YES", "OS_ACTIVITY_MODE=debug" };
++		for (int i = 0; want && i < (debug ? 2 : 1); i++) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(vars[i]), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
