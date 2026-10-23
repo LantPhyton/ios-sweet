@@ -38,7 +38,7 @@ unrolled row loop, rows with the same source copied from the row above.
  #include <sys/proc.h>
  
  enum {
-@@ -82,6 +85,20 @@
+@@ -82,6 +85,22 @@
  #define SWEET_FB_LOGICAL_H              2436
  #define SWEET_FB_FORMAT_BGRA            0x42475241
  
@@ -54,12 +54,29 @@ unrolled row loop, rows with the same source copied from the row above.
 +uint64_t sweet_fb_stat_copy_ns, sweet_fb_stat_copy_max_ns, sweet_fb_stat_ticks;
 +uintptr_t sweet_fb_stat_pixels;
 +uint32_t sweet_fb_stat_rowbytes, sweet_fb_stat_width, sweet_fb_stat_height;
++uint64_t sweet_fb_stat_iv[4], sweet_fb_stat_wait_ns, sweet_fb_stat_waits, sweet_fb_stat_flips;
++uint64_t sweet_fb_stat_flip_late;
 +}
 +
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
  };
-@@ -116,13 +133,37 @@
+@@ -105,6 +124,14 @@
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	/* surya, suryafb=4: two panel buffers inside the bootloader's splash
++	 * region (DT cont_splash_region 0x9c000000, 0x1800000 bytes), the pipe
++	 * switched between them at vsync; fDst is where the copy writes. */
++	uintptr_t     fDst;
++	uintptr_t     fBufPixels[2];
++	uint32_t      fBufPhys[2];
++	uint32_t      fFront;
++	SweetSurface *fBackSurface;
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -116,13 +143,41 @@
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -83,6 +100,7 @@ unrolled row loop, rows with the same source copied from the row above.
 +	void workerLoop(void);
 +	void copyLoop(void);
 +	void swapWait(void);
++	void swapWaitInner(void);
  };
 +static int surya_fb_mode;
 +static void surya_fb_copy_thread(void *arg, wait_result_t wr);
@@ -95,10 +113,13 @@ unrolled row loop, rows with the same source copied from the row above.
 +extern "C" int surya_fb2x_reset_cache(void); /* bsd/dev/sweet_touch.c */
 +extern "C" int surya_panel_line(void);        /* bsd/dev/sweet_touch.c */
 +extern "C" void surya_bind_render_thread(void); /* osfmk/kern/exception.c */
++extern "C" uint32_t surya_mdss_scanout(void);   /* bsd/dev/sweet_touch.c */
++extern "C" int surya_mdss_flip(uint32_t phys);
++extern "C" int surya_mdss_flip_pending(void);
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
-@@ -176,6 +217,26 @@
+@@ -176,6 +231,26 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -125,17 +146,47 @@ unrolled row loop, rows with the same source copied from the row above.
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -195,7 +256,34 @@
+@@ -195,7 +270,64 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
 -	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
 +	PE_parse_boot_argn("suryastat", &sweet_fb_stat_on, sizeof(sweet_fb_stat_on));
 +	sweet_fb_stat_pixels = fPixels;
++	fDst = fPixels;
 +	sweet_fb_stat_rowbytes = fRowBytes;
 +	sweet_fb_stat_width = fWidth;
 +	sweet_fb_stat_height = fHeight;
 +	PE_parse_boot_argn("suryafb", &surya_fb_mode, sizeof(surya_fb_mode));
++	if (surya_fb_mode == 4) {
++		const uint64_t splash = 0x9c000000ULL, splash_len = 0x1800000ULL, second = 0xa00000ULL;
++		uint64_t len = (uint64_t)fHeight * fRowBytes;
++		uint32_t scan = surya_mdss_scanout();
++		if (fPhys != splash || len > second || second + len > splash_len || scan != (uint32_t)fPhys) {
++			IOLog("SWEET FB: flip: panel 0x%llx len 0x%llx scanout 0x%x do not fit the splash region; mode 2\n",
++			    (unsigned long long)fPhys, (unsigned long long)len, scan);
++			surya_fb_mode = 2;
++		} else {
++			fBackSurface = sweet_surface_create_physical(fPhys + second, fWidth, fHeight, fRowBytes,
++			    SWEET_FB_FORMAT_BGRA);
++			uintptr_t back = fBackSurface != NULL ? fBackSurface->kernelAddress() : 0;
++			if (back == 0) {
++				IOLog("SWEET FB: flip: no mapping for the second buffer; mode 2\n");
++				surya_fb_mode = 2;
++			} else {
++				for (uint32_t y = 0; y < fHeight; y++) {
++					memset((void *)(back + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
++				}
++				fBufPixels[0] = fPixels;
++				fBufPixels[1] = back;
++				fBufPhys[0] = (uint32_t)fPhys;
++				fBufPhys[1] = (uint32_t)(fPhys + second);
++				fFront = 0;
++				IOLog("SWEET FB: flip: buffers 0x%x and 0x%x, the pipe switches at vsync\n",
++				    fBufPhys[0], fBufPhys[1]);
++			}
++		}
++	}
 +	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ULL, &fVsyncPeriod);
 +	if (surya_fb_mode) {
 +		thread_t t;
@@ -161,7 +212,7 @@ unrolled row loop, rows with the same source copied from the row above.
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -212,13 +300,23 @@
+@@ -212,13 +344,23 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -185,7 +236,15 @@ unrolled row loop, rows with the same source copied from the row above.
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
  		IOMobileFramebufferUserClient *client =
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
-@@ -239,12 +337,20 @@
+@@ -233,18 +375,27 @@
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				uintptr_t front = surya_fb_mode == 4 ? fb->fBufPixels[fb->fFront] : fb->fPixels;
++				volatile uint32_t *row = (volatile uint32_t *)(front + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
  		}
@@ -209,7 +268,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +362,164 @@
+@@ -256,7 +407,194 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -244,7 +303,21 @@ unrolled row loop, rows with the same source copied from the row above.
 +		IOLockUnlock(fLock);
 +		int line_start = -1, line_wait = -1;
 +		uint64_t t_wait0 = 0, t_wait1 = 0;
-+		if (surya_fb_mode >= 2) {
++		uint32_t back = 0;
++		if (surya_fb_mode == 4) {
++			/* The buffer about to be written must be off the panel: the last
++			 * flip (to the other one) has to be latched first. */
++			uint64_t until = mach_absolute_time() + 2 * fVsyncPeriod;
++			if (surya_mdss_flip_pending()) {
++				sweet_fb_stat_flip_late++;
++				while (surya_mdss_flip_pending() && mach_absolute_time() < until) {
++					IODelay(100);
++				}
++			}
++			back = fFront ^ 1;
++			fDst = fBufPixels[back];
++		}
++		if (surya_fb_mode == 2 || surya_fb_mode == 3) {
 +			/* Wait for the scan to pass the top of a frame, then copy behind it
 +			 * (surya_panel_line, bsd/dev/sweet_touch.c). At most 20 ms. */
 +			uint64_t until = mach_absolute_time() + fVsyncPeriod + fVsyncPeriod / 4;
@@ -300,7 +373,12 @@ unrolled row loop, rows with the same source copied from the row above.
 +		} else {
 +			present(fCopyRec);
 +		}
-+		if (surya_fb_mode >= 2) {
++		if (surya_fb_mode == 4) {
++			(void)surya_mdss_flip(fBufPhys[back]);
++			fFront = back;
++			sweet_fb_stat_flips++;
++		}
++		if (surya_fb_mode == 2 || surya_fb_mode == 3) {
 +			static unsigned diag_n;
 +			diag_n++;
 +			if (diag_n <= 30 || diag_n % 300 == 0) {
@@ -354,6 +432,17 @@ unrolled row loop, rows with the same source copied from the row above.
 +void
 +AppleCLCD::swapWait(void)
 +{
++	uint64_t t0 = mach_absolute_time();
++	swapWaitInner();
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	sweet_fb_stat_wait_ns += ns;
++	sweet_fb_stat_waits++;
++}
++
++void
++AppleCLCD::swapWaitInner(void)
++{
 +	uint64_t deadline = mach_absolute_time() + 3 * fVsyncPeriod;
 +	IOLockLock(fLock);
 +	if (surya_fb_mode == 3) {
@@ -375,7 +464,7 @@ unrolled row loop, rows with the same source copied from the row above.
  }
  
  void
-@@ -289,6 +552,37 @@
+@@ -289,6 +627,37 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -413,7 +502,17 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -302,14 +596,25 @@
+@@ -299,17 +668,35 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	static uint64_t last_swap;
++	uint64_t now = mach_absolute_time(), ns = 0;
++	if (last_swap != 0) {
++		absolutetime_to_nanoseconds(now - last_swap, &ns);
++		sweet_fb_stat_iv[ns < 20000000ULL ? 0 : ns < 37000000ULL ? 1 : ns < 55000000ULL ? 2 : 3]++;
++	}
++	last_swap = now;
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -440,7 +539,7 @@ unrolled row loop, rows with the same source copied from the row above.
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -390,12 +695,96 @@
+@@ -390,12 +777,96 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -488,7 +587,7 @@ unrolled row loop, rows with the same source copied from the row above.
 +				 * to the panel in one sequential memcpy; a repeated source row
 +				 * is the same buffer again. 22.10: reading the row above from
 +				 * the panel made a frame cost 30 ms instead of 9. */
-+				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++				uint32_t *drow = (uint32_t *)(fDst + (uint64_t)py * fRowBytes);
 +				if (ly != prev_ly) {
 +					prev_ly = ly;
 +					const uint32_t *srow = (const uint32_t *)(src + s->offset +
@@ -519,10 +618,11 @@ unrolled row loop, rows with the same source copied from the row above.
 +		} else if (src != 0 && bpe == 4) {
 +			uint64_t t0 = sweet_fb_stat_on ? mach_absolute_time() : 0;
  			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
 +				if ((dy + y) % parts != part) {
 +					continue;
 +				}
- 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(fDst + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
  				    (size_t)w * 4);
  			}
@@ -538,7 +638,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -499,6 +888,7 @@
+@@ -499,6 +970,7 @@
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
@@ -546,7 +646,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		fFB->swap(rec);
  		break;
  	}
-@@ -542,10 +932,15 @@
+@@ -542,10 +1014,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);

@@ -85,7 +85,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void sweet_touch_init(void);
  
  #define TOUCH_SE_PA      0x00a84000u
-@@ -635,6 +652,2820 @@
+@@ -635,6 +652,2894 @@
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -2368,6 +2368,8 @@ class once the root is mounted, for the @2x display mode of 0911.
 +extern uint64_t sweet_fb_stat_copy_ns, sweet_fb_stat_copy_max_ns, sweet_fb_stat_ticks;
 +extern uintptr_t sweet_fb_stat_pixels;
 +extern uint32_t sweet_fb_stat_rowbytes, sweet_fb_stat_width, sweet_fb_stat_height;
++extern uint64_t sweet_fb_stat_iv[4], sweet_fb_stat_wait_ns, sweet_fb_stat_waits, sweet_fb_stat_flips;
++extern uint64_t sweet_fb_stat_flip_late;
 +extern unsigned int processor_count;
 +
 +static struct {
@@ -2623,6 +2625,9 @@ class once the root is mounted, for the @2x display mode of 0911.
 +	uint64_t swaps = sweet_fb_stat_swaps, dups = sweet_fb_stat_dups, copies = sweet_fb_stat_copies;
 +	uint64_t cns = sweet_fb_stat_copy_ns, ticks = sweet_fb_stat_ticks;
 +	uint32_t frames = sst.mdss ? touch_rd(sst.mdss + 0x6b800u, 0xac) : 0;
++	uint64_t iv0[4], wns0 = sweet_fb_stat_wait_ns, wn0 = sweet_fb_stat_waits;
++	uint64_t fl0 = sweet_fb_stat_flips, fll0 = sweet_fb_stat_flip_late;
++	memcpy(iv0, sweet_fb_stat_iv, sizeof(iv0));
 +	for (;;) {
 +		unsigned idle[8] = {0}, samples = 0;
 +		sweet_fb_stat_copy_max_ns = 0;
@@ -2645,6 +2650,27 @@ class once the root is mounted, for the @2x display mode of 0911.
 +		    f - frames, idle[0] * 100u / samples, idle[1] * 100u / samples, idle[2] * 100u / samples,
 +		    idle[3] * 100u / samples, idle[4] * 100u / samples, idle[5] * 100u / samples,
 +		    idle[6] * 100u / samples, idle[7] * 100u / samples);
++		{
++			/* 23.10: the frame rhythm. Swap-to-swap intervals (a 60 Hz frame
++			 * is 16.7 ms, one missed vsync 33 ms), the time CoreAnimation spends
++			 * in SwapWait, page flips (suryafb=4) and flips that had to wait
++			 * for the previous one to latch. */
++			uint64_t iv[4], wns = sweet_fb_stat_wait_ns, wn = sweet_fb_stat_waits;
++			uint64_t fl = sweet_fb_stat_flips, fll = sweet_fb_stat_flip_late;
++			memcpy(iv, sweet_fb_stat_iv, sizeof(iv));
++			printf("SURYA STAT: 10 s frames: swap intervals <20 ms %llu, 20-37 %llu, 37-55 %llu, >55 %llu; "
++			    "SwapWait %llu calls mean %llu us; flips %llu (waited for latch %llu)\n",
++			    (unsigned long long)(iv[0] - iv0[0]), (unsigned long long)(iv[1] - iv0[1]),
++			    (unsigned long long)(iv[2] - iv0[2]), (unsigned long long)(iv[3] - iv0[3]),
++			    (unsigned long long)(wn - wn0),
++			    (unsigned long long)(wn > wn0 ? (wns - wns0) / (wn - wn0) / 1000ULL : 0),
++			    (unsigned long long)(fl - fl0), (unsigned long long)(fll - fll0));
++			memcpy(iv0, iv, sizeof(iv0));
++			wns0 = wns;
++			wn0 = wn;
++			fl0 = fl;
++			fll0 = fll;
++		}
 +		stat_tsens();
 +		swaps = s;
 +		dups = d;
@@ -2720,6 +2746,54 @@ class once the root is mounted, for the @2x display mode of 0911.
 +		}
 +	}
 +	return (int)(touch_rd(surya_mdss_map + 0x6b800u, 0xb0) & 0xffffu);
++}
++
++/*
++ * surya 23.10, suryafb=4: page flipping. The pipe vig0 (MDSS + 0x5000) fetches
++ * the panel image from SSPP_SRC0_ADDR (+0x14; the bootloader left 0x9c000000,
++ * its splash buffer). The register is double-buffered: it takes effect at the
++ * next vsync after the pipe's bit is written to CTL0_FLUSH (MDSS + 0x2000,
++ * +0x18), and the hardware clears the bits once latched. Flushed with the pipe
++ * (bit 0), its mixer LM0 (bit 6) and the CTL itself (bit 17), as Linux does
++ * for a plane update (reference/linux-dpu: dpu_hw_sspp.c, dpu_hw_ctl.c).
++ */
++#define SURYA_MDSS_VIG0         0x5000u
++#define SURYA_MDSS_CTL0         0x2000u
++#define SURYA_SSPP_SRC0_ADDR    0x14u
++#define SURYA_CTL_FLUSH         0x18u
++#define SURYA_FLUSH_BITS        ((1u << 0) | (1u << 6) | (1u << 17))
++
++uint32_t surya_mdss_scanout(void);
++int surya_mdss_flip(uint32_t phys);
++int surya_mdss_flip_pending(void);
++
++uint32_t
++surya_mdss_scanout(void)
++{
++	if (surya_panel_line() < 0) {
++		return 0;
++	}
++	return touch_rd(surya_mdss_map + SURYA_MDSS_VIG0, SURYA_SSPP_SRC0_ADDR);
++}
++
++int
++surya_mdss_flip(uint32_t phys)
++{
++	if (surya_panel_line() < 0) {
++		return -1;
++	}
++	touch_wr(surya_mdss_map + SURYA_MDSS_VIG0, SURYA_SSPP_SRC0_ADDR, phys);
++	touch_wr(surya_mdss_map + SURYA_MDSS_CTL0, SURYA_CTL_FLUSH, SURYA_FLUSH_BITS);
++	return 0;
++}
++
++int
++surya_mdss_flip_pending(void)
++{
++	if (!surya_mdss_map) {
++		return 0;
++	}
++	return (touch_rd(surya_mdss_map + SURYA_MDSS_CTL0, SURYA_CTL_FLUSH) & SURYA_FLUSH_BITS) != 0;
 +}
 +
 +/*
@@ -2906,7 +2980,7 @@ class once the root is mounted, for the @2x display mode of 0911.
  void
  sweet_touch_init(void)
  {
-@@ -644,17 +3475,78 @@
+@@ -644,17 +3549,78 @@
  		return;
  	}
  	st.started = true;
