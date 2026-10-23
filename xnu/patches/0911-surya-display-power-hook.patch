@@ -208,7 +208,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +361,162 @@
+@@ -256,7 +361,164 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -251,12 +251,14 @@ unrolled row loop, rows with the same source copied from the row above.
 +			int line = surya_panel_line();
 +			line_wait = line;
 +			if (line >= 0) {
-+				/* first let a scan that is near the top move on, then catch the next top */
-+				while (line < 200 && mach_absolute_time() < until) {
-+					IODelay(200);
-+					line = surya_panel_line();
-+				}
-+				while (line >= 200 && mach_absolute_time() < until) {
++				/* 23.10 (shim-xr9 diagnostics): LINE_COUNT runs 0..~4860 a frame, two
++				 * counts per panel row. A copy started at the top overtook the scan a
++				 * few rows down (a seam at the top) and the second thread's rows were
++				 * caught in the middle. Start while the scan is in the bottom part
++				 * (counts 3900..4600, rows ~1950..2300): it wraps to row 0 after
++				 * ~2.5 ms, by when the copy, twice as fast as the scan, is ~700 rows
++				 * in; the two never meet if the copy takes under ~15 ms. */
++				while ((line < 3900 || line >= 4600) && mach_absolute_time() < until) {
 +					IODelay(100);
 +					line = surya_panel_line();
 +				}
@@ -372,7 +374,7 @@ unrolled row loop, rows with the same source copied from the row above.
  }
  
  void
-@@ -289,6 +549,37 @@
+@@ -289,6 +551,37 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -410,7 +412,7 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -302,14 +593,25 @@
+@@ -302,14 +595,25 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -437,7 +439,7 @@ unrolled row loop, rows with the same source copied from the row above.
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -390,12 +692,96 @@
+@@ -390,12 +694,96 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -535,7 +537,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -542,10 +928,15 @@
+@@ -542,10 +930,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);
