@@ -1,14 +1,206 @@
-surya: answer dyld's AMFI policy query
+surya: AMFI and Sandbox answers that app extensions and apps need
 
-dyld asks AMFI (__mac_syscall("AMFI", 0x5a)) what the process may do;
-without an answer it allows nothing and apps that load their own
-frameworks through @rpath (Books, Podcasts) die at launch. The built-in
-AMFI policy is now named "AMFI" and answers as AMFI does for an ordinary
-app: @-paths and classic fallback paths. Other AMFI calls still fail
-(ENOPOLICY) and are logged once.
+The built-in AMFI policy is named "AMFI" so that __mac_syscall finds it, and
+answers two calls: 0x5a (dyld's policy query; @rpath and fallback paths, as for
+an ordinary app: Books and Podcasts died on "@ path expansion") and 0x60
+(boot-arg state 0x86, "code signing enforcement off": ExtensionKit reads the
+extension-point catalog only then; lgrachov/ios-qemu 0098, Bergamota 0099,
+HackiOS). The Sandbox stand-in issues and consumes extension tokens (ops 5, 6)
+and gives app extensions a container path (op 4), from lgrachov/ios-qemu 0099
+and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -305,8 +305,50 @@
+@@ -24,6 +24,9 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
++#include <sys/kauth.h>
++#include <libkern/OSAtomic.h>
++#include <kern/kalloc.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+@@ -279,14 +282,161 @@
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); extensions are issued and
++ * consumed and app extensions get a container path (below); other
++ * container queries fail with ENOENT. The first use of each operation
++ * number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/* surya 24.10: from lgrachov/ios-qemu 0099 (confirmed there: no more sandbox
++ * errno=2 from poster extensions) and 0102 (PlugInKit stopped killing app
++ * extensions, 74 crashes per boot -> 0). */
++/*
++ * Sandbox extensions, ABI of iOS 16.7 libsystem_sandbox:
++ * op 5 (_sandbox_extension_issue, behind sandbox_extension_issue_file/
++ * _mach/_generic/..._to_process) passes struct sweet_sandbox_issue_args;
++ * the kernel writes a NUL-terminated token into the caller's malloc(2048)
++ * buffer. op 6 (sandbox_extension_consume) passes the token, strlen + 1 and
++ * a pointer to an int64 handle (-1 = failure in the caller); op 7 releases
++ * a handle and op 8 updates a file token (both succeed by default).
++ * Userland treats tokens as opaque strings (only "invalid" is special), so
++ * a token with the layout of a real one and a dummy HMAC is enough: nothing
++ * is enforced. Before, both ops failed with ENOENT and every PosterBoard
++ * poster extension logged "SandboxExtensionError ... cannot extend access
++ * of <PRSPosterPath ...> due to sandbox errno=2" (no Collections poster).
++ */
++struct sweet_sandbox_issue_args {
++	user64_addr_t extension_class;
++	uint64_t      type;             /* 0 file, else mach/iokit/generic */
++	user64_addr_t data;             /* path or name */
++	uint64_t      flags;
++	user64_addr_t token;            /* out, SWEET_SANDBOX_TOKEN_MAX bytes */
++	int64_t       pid;              /* _to_process: audit token pid */
++	uint64_t      pidversion;
++};
++
++struct sweet_sandbox_consume_args {
++	user64_addr_t token;
++	uint64_t      token_len;
++	user64_addr_t handle;           /* out, int64_t */
++};
++
++#define SWEET_SANDBOX_TOKEN_MAX 2048
++#define SWEET_SANDBOX_CLASS_MAX 128
++
++static SInt64 sweet_sandbox_handles;
++
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	struct sweet_sandbox_issue_args args;
++	char ext_class[SWEET_SANDBOX_CLASS_MAX];
++	size_t len;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	if (copyinstr(args.extension_class, ext_class, sizeof(ext_class), &len)) {
++		ext_class[0] = '\0';
++	}
++	char *buf = kalloc_data(SWEET_SANDBOX_TOKEN_MAX + MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	char *data = buf + SWEET_SANDBOX_TOKEN_MAX;
++	if (args.data == 0 || copyinstr(args.data, data, MAXPATHLEN, &len)) {
++		data[0] = '\0';
++	}
++	uint64_t id = (uint64_t)OSIncrementAtomic64(&sweet_sandbox_handles) + 1;
++	int n = snprintf(buf, SWEET_SANDBOX_TOKEN_MAX,
++	    "%016llx%016llx%016llx%016llx;00;00000000;00000000;00000000;%016llx;%s;01;%08llx;%016llx;%s",
++	    id, id, id, id, (unsigned long long)strlen(ext_class), ext_class,
++	    args.type, id, data);
++	if (n < 0 || n >= SWEET_SANDBOX_TOKEN_MAX) {
++		error = ENAMETOOLONG;
++	} else {
++		error = copyout(buf, args.token, (size_t)n + 1);
++	}
++	kfree_data(buf, SWEET_SANDBOX_TOKEN_MAX + MAXPATHLEN);
++	return error;
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	struct sweet_sandbox_consume_args args;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	int64_t handle = OSIncrementAtomic64(&sweet_sandbox_handles) + 1;
++	return copyout(&handle, args.handle, sizeof(handle));
++}
++
++/*
++ * Op 4 (sandbox_container_path_for_pid / _for_audit_token) passes
++ * struct sweet_sandbox_container_args; on success the kernel writes the
++ * NUL-terminated container path into buf. libsystem_sandbox's
++ * _sandbox_in_a_container() is "op 4 succeeded", and containerized
++ * processes take their home from it, so only processes that need one get a
++ * path: PlugInKit's checkEnvironment aborts every app extension without
++ * it ("plugin has invalid sandbox or container: error 2"; Spotlight index
++ * extensions and the speech synthesizer AUs crash-looped, ~74 crashes per
++ * boot). App extensions (executable inside a .appex) running as mobile get
++ * the mobile home, as ios-sailfish found; on an iPhone they would get
++ * Containers/Data/PluginKitPlugin/<uuid>. Everything else keeps ENOENT, as
++ * an uncontainerized process on iOS.
++ */
++struct sweet_sandbox_container_args {
++	int64_t       pid;              /* 0 = the caller */
++	uint64_t      pidversion;       /* audit token variant */
++	user64_addr_t buf;
++	uint64_t      buflen;
++	uint64_t      by_audit_token;
++};
++
++#define SWEET_MOBILE_UID        501
++#define SWEET_MOBILE_HOME       "/private/var/mobile"
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_container_path(struct proc *caller, user_addr_t arg)
++{
++	struct sweet_sandbox_container_args args;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	proc_t p = args.pid == 0 ? proc_find(proc_pid(caller)) : proc_find((int)args.pid);
++	if (p == NULL) {
++		return ESRCH;
++	}
++	kauth_cred_t cred = kauth_cred_proc_ref(p);
++	bool mobile = kauth_cred_getuid(cred) == SWEET_MOBILE_UID;
++	kauth_cred_unref(&cred);
++	bool appex = false;
++	vnode_t vp = mobile ? proc_getexecutablevnode(p) : NULLVP;
++	proc_rele(p);
++	if (vp != NULLVP) {
++		char *path = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_NOFAIL);
++		int len = MAXPATHLEN;
++		if (vn_getpath(vp, path, &len) == 0) {
++			appex = strnstr(path, ".appex/", MAXPATHLEN) != NULL;
++		}
++		kfree_data(path, MAXPATHLEN);
++		vnode_put(vp);
++	}
++	if (!appex) {
++		return ENOENT;
++	}
++	if (args.buflen < sizeof(SWEET_MOBILE_HOME)) {
++		return ERANGE;
++	}
++	return copyout(SWEET_MOBILE_HOME, args.buf, sizeof(SWEET_MOBILE_HOME));
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,9 +445,12 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
++	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(p, arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
+@@ -305,8 +458,66 @@
  	}
  }
  
@@ -26,6 +218,18 @@ app: @-paths and classic fallback paths. Other AMFI calls still fail
 + * before (ENOPOLICY), and is logged once.
 + */
 +#define SWEET_AMFI_CHECK_DYLD_POLICY_SELF       0x5a
++/*
++ * surya 24.10, from lgrachov/ios-qemu 0098, ry-diffusion/Bergamota 0099 and
++ * HackiOS (all confirmed: wallpapers and widgets): call 0x60 is
++ * amfi_interface_query_bootarg_state, a uint64 written to arg. ExtensionKit
++ * takes (state & 0x86) as "code-signing enforcement off" and only then reads
++ * the extension-point catalog (/System/Library/xpc/extensions.plist) without
++ * checking its signature; otherwise "Unable to find AMFI", no extension
++ * point is known, LaunchServices drops every .appex and pkd, PosterBoard and
++ * chronod get nothing. Our live log: "SWEET AMFI: lsd call 0x60 not handled".
++ */
++#define SWEET_AMFI_QUERY_BOOTARG_STATE          0x60
++#define SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF      0x86ULL
 +#define SWEET_AMFI_DYLD_ALLOW_AT_PATH           (1ULL << 0)
 +#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    (1ULL << 3)
 +
@@ -34,6 +238,10 @@ app: @-paths and classic fallback paths. Other AMFI calls still fail
 +static int
 +sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
 +{
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF;
++		return copyout(&state, arg, sizeof(state));
++	}
 +	if (call != SWEET_AMFI_CHECK_DYLD_POLICY_SELF) {
 +		if (call >= 0 && call < 256 &&
 +		    !(sweet_amfi_calls_seen[call / 64] & (1ULL << (call % 64)))) {
@@ -59,7 +267,7 @@ app: @-paths and classic fallback paths. Other AMFI calls still fail
  };
  
  /*
-@@ -360,7 +402,7 @@
+@@ -360,7 +571,7 @@
  static mac_policy_handle_t sweet_sandbox_mac_handle;
  
  static struct mac_policy_conf sweet_amfi_mac_conf = {

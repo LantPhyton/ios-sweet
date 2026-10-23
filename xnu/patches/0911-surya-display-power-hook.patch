@@ -212,15 +212,24 @@ unrolled row loop, rows with the same source copied from the row above.
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -212,13 +344,23 @@
+@@ -212,13 +344,31 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
 +	sweet_fb_stat_ticks = count;
++	/*
++	 * surya 24.10, from NWylynko/ios-flame 0121 (15.8 -> 21 fps there) and
++	 * PixeliOS 0101: CA::WindowServer::IOMFBServer::vsync_callback takes the
++	 * third pair as the refresh period (next vsync = this one + period, CA's
++	 * CVTimeStamp videoRefreshPeriod). It was 0, so CoreAnimation saw every
++	 * frame's deadline as already past.
++	 */
++	uint64_t period = fb->fVsyncPeriod;
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
- 		0, 0,
+-		0, 0,
++		(uint32_t)period, (uint32_t)(period >> 32),
  	};
 +	/* surya mode: the next deadline is fixed now, before any work; a tick
 +	 * that is already late by more than a period starts a fresh series. */
@@ -236,7 +245,7 @@ unrolled row loop, rows with the same source copied from the row above.
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
  		IOMobileFramebufferUserClient *client =
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
-@@ -233,18 +375,27 @@
+@@ -233,18 +383,27 @@
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
@@ -268,7 +277,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +407,194 @@
+@@ -256,7 +415,194 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -464,7 +473,7 @@ unrolled row loop, rows with the same source copied from the row above.
  }
  
  void
-@@ -289,6 +627,37 @@
+@@ -289,6 +635,37 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -502,7 +511,7 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -299,17 +668,35 @@
+@@ -299,17 +676,35 @@
  void
  AppleCLCD::swap(const uint8_t *rec)
  {
@@ -539,7 +548,7 @@ unrolled row loop, rows with the same source copied from the row above.
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -390,12 +777,96 @@
+@@ -390,12 +785,96 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -638,7 +647,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -499,6 +970,7 @@
+@@ -499,6 +978,7 @@
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
@@ -646,7 +655,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		fFB->swap(rec);
  		break;
  	}
-@@ -542,10 +1014,15 @@
+@@ -542,10 +1022,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);

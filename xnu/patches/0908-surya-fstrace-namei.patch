@@ -6,12 +6,14 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 "FS name[pid] namei op N path -> error".
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -162,6 +162,63 @@
+@@ -162,6 +162,185 @@
   *		lookup: ???
   *		VNOP_READLINK:???
   */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <pexpert/pexpert.h>
++#include <sys/uio.h>
++#include <sys/dirent.h>
 +/*
 + * surya: file-system trace for named processes. A daemon that fails on a
 + * missing or broken path (tzinit left /var/db/timezone/zoneinfo absent and
@@ -55,6 +57,126 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +	return false;
 +}
 +
++/*
++ * surya 24.10: boot-arg sweetlsreset=1 deletes the LaunchServices database
++ * (/private/var/mobile/Containers/Data/InternalDaemon/<uuid>/Library/Caches/
++ * com.apple.LaunchServices*) before launchd starts, so lsd seeds it again. A
++ * database seeded while the extension-point catalog was unreadable keeps every
++ * app extension out for good: lsd reuses it as "seeded" (ry-diffusion/Bergamota
++ * 0106 and docs/EXTENSION_POINTS_2.md; lgrachov/ios-qemu 80bbe28573 — poster
++ * providers and widgets ran only after a fresh seed). Bergamota names its
++ * container's UUID; ours is not known in advance, so every InternalDaemon
++ * container is searched. Goes through HFS+ and its journal. One-shot: boot
++ * without the argument afterwards.
++ */
++extern errno_t vnode_readdir64(struct vnode *vp, struct uio *uio, int flags, int *eofflag,
++    int *numdirent, vfs_context_t ctxp);
++extern int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg,
++    enum uio_seg segflg, int unlink_flags);
++void sweet_ls_reset(void);
++
++#define SWEET_LS_CONTAINERS     "/private/var/mobile/Containers/Data/InternalDaemon"
++#define SWEET_LS_MAX_NAMES      64
++
++/* Names in a directory (no dot entries), at most max, each up to 255 bytes. */
++static int
++sweet_dir_names(const char *dir, char (*names)[256], int max, int *count)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t dvp = NULLVP;
++	*count = 0;
++	int error = vnode_lookup(dir, 0, &dvp, ctx);
++	if (error) {
++		return error;
++	}
++	const size_t bufsize = 16384;
++	char *buf = kalloc_data(bufsize, Z_WAITOK);
++	if (buf == NULL) {
++		vnode_put(dvp);
++		return ENOMEM;
++	}
++	off_t off = 0;
++	int eof = 0;
++	for (int pass = 0; !eof && pass < 64 && *count < max; pass++) {
++		uio_t uio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
++		if (uio == NULL) {
++			error = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(buf), bufsize);
++		int numdirent = 0;
++		error = vnode_readdir64(dvp, uio, VNODE_READDIR_EXTENDED, &eof, &numdirent, ctx);
++		size_t got = bufsize - (size_t)uio_resid(uio);
++		off = uio_offset(uio);
++		uio_free(uio);
++		if (error || got == 0) {
++			break;
++		}
++		for (size_t pos = 0; pos + offsetof(struct direntry, d_name) < got && *count < max;) {
++			struct direntry *de = (struct direntry *)(void *)(buf + pos);
++			if (de->d_reclen == 0) {
++				break;
++			}
++			if (de->d_ino != 0 && de->d_namlen > 0 && de->d_name[0] != '.') {
++				size_t n = MIN((size_t)de->d_namlen, (size_t)255);
++				memcpy(names[*count], de->d_name, n);
++				names[*count][n] = '\0';
++				(*count)++;
++			}
++			pos += de->d_reclen;
++		}
++	}
++	kfree_data(buf, bufsize);
++	vnode_put(dvp);
++	return error;
++}
++
++void
++sweet_ls_reset(void)
++{
++	uint32_t on = 0;
++	if (!PE_parse_boot_argn("sweetlsreset", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	char (*uuids)[256] = kalloc_data(SWEET_LS_MAX_NAMES * 256, Z_WAITOK);
++	char (*files)[256] = kalloc_data(SWEET_LS_MAX_NAMES * 256, Z_WAITOK);
++	char *path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (uuids == NULL || files == NULL || path == NULL) {
++		printf("SWEET LS: no memory\n");
++		goto out;
++	}
++	int nu = 0, deleted = 0;
++	int error = sweet_dir_names(SWEET_LS_CONTAINERS, uuids, SWEET_LS_MAX_NAMES, &nu);
++	printf("SWEET LS: %d InternalDaemon containers (error %d)\n", nu, error);
++	for (int i = 0; i < nu; i++) {
++		snprintf(path, MAXPATHLEN, "%s/%s/Library/Caches", SWEET_LS_CONTAINERS, uuids[i]);
++		int nf = 0;
++		if (sweet_dir_names(path, files, SWEET_LS_MAX_NAMES, &nf) != 0) {
++			continue;
++		}
++		for (int j = 0; j < nf; j++) {
++			if (strnstr(files[j], "LaunchServices", sizeof(files[j])) == NULL) {
++				continue;
++			}
++			snprintf(path, MAXPATHLEN, "%s/%s/Library/Caches/%s", SWEET_LS_CONTAINERS, uuids[i], files[j]);
++			error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++			printf("SWEET LS: unlink %s -> %d\n", path, error);
++			deleted += error == 0;
++		}
++	}
++	printf("SWEET LS: %d LaunchServices database files deleted; lsd seeds anew\n", deleted);
++out:
++	if (uuids != NULL) {
++		kfree_data(uuids, SWEET_LS_MAX_NAMES * 256);
++	}
++	if (files != NULL) {
++		kfree_data(files, SWEET_LS_MAX_NAMES * 256);
++	}
++	if (path != NULL) {
++		kfree_data(path, MAXPATHLEN);
++	}
++}
++
 +static void
 +sweet_fstrace_namei(struct nameidata *ndp, proc_t p, int error)
 +{
@@ -70,7 +192,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  int
  namei(struct nameidata *ndp)
  {
-@@ -493,6 +550,9 @@
+@@ -493,6 +672,9 @@
  				}
  			}
  
@@ -80,7 +202,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  			return 0;
  		}
  
-@@ -529,6 +589,9 @@
+@@ -529,6 +711,9 @@
  		vnode_put(ndp->ni_vp);
  	}
  error_out:
