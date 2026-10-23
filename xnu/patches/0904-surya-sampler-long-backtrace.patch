@@ -15,11 +15,11 @@ to it.
  #include <vm/vm_shared_region.h>
  #include <arm/thread.h>
 +#include <arm/cpu_data_internal.h> /* surya: getCpuDatap()->cpu_base_timebase */
-+#include <kern/timer.h>             /* surya: timer_grab for the sampler */
++#include <kern/recount.h>           /* surya: recount_thread_times for the sampler */
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1011,35 +1013,130 @@
+@@ -1011,35 +1013,131 @@
  	}
  	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
  
@@ -53,8 +53,9 @@ to it.
 +		 * its busy share between samples; the saved pc is stale for a thread
 +		 * that is running in user mode. */
 +		uint64_t ut = 0, st = 0;
-+		absolutetime_to_nanoseconds(timer_grab(&thread->user_timer), &ut);
-+		absolutetime_to_nanoseconds(timer_grab(&thread->system_timer), &st);
++		struct recount_times_mach rtm = recount_thread_times(thread);
++		absolutetime_to_nanoseconds(rtm.rtm_user, &ut);
++		absolutetime_to_nanoseconds(rtm.rtm_system, &st);
 +		printf("SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx cpu u=%llu s=%llu\n", name, t,
 +		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss),
 +		    (unsigned long long)ut, (unsigned long long)st);
