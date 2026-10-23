@@ -208,7 +208,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +361,126 @@
+@@ -256,7 +361,162 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -241,11 +241,15 @@ unrolled row loop, rows with the same source copied from the row above.
 +		memcpy(fCopyRec, fPending, SWEET_FB_SWAP_REC_SIZE);
 +		fDirty = false;
 +		IOLockUnlock(fLock);
++		int line_start = -1, line_wait = -1;
++		uint64_t t_wait0 = 0, t_wait1 = 0;
 +		if (surya_fb_mode >= 2) {
 +			/* Wait for the scan to pass the top of a frame, then copy behind it
 +			 * (surya_panel_line, bsd/dev/sweet_touch.c). At most 20 ms. */
 +			uint64_t until = mach_absolute_time() + fVsyncPeriod + fVsyncPeriod / 4;
++			t_wait0 = mach_absolute_time();
 +			int line = surya_panel_line();
++			line_wait = line;
 +			if (line >= 0) {
 +				/* first let a scan that is near the top move on, then catch the next top */
 +				while (line < 200 && mach_absolute_time() < until) {
@@ -257,6 +261,26 @@ unrolled row loop, rows with the same source copied from the row above.
 +					line = surya_panel_line();
 +				}
 +			}
++			line_start = line;
++			t_wait1 = mach_absolute_time();
++			/* 23.10 diagnostics: seams stayed (top and middle). Once: how LINE_COUNT
++			 * sweeps over 40 ms; then the first 30 copies and one in 300: the line
++			 * at the swap, after the wait, after the copy, and the times. */
++			static unsigned diag_count;
++			if (diag_count == 0) {
++				char buf[200];
++				int n = 0;
++				for (unsigned i = 0; i < 40; i++) {
++					n += snprintf(buf + n, sizeof(buf) - (size_t)n, " %d", surya_panel_line());
++					if (n > 170) {
++						IOLog("SWEET FB: line sweep (1 ms):%s\n", buf);
++						n = 0;
++					}
++					IODelay(1000);
++				}
++				IOLog("SWEET FB: line sweep (1 ms):%s\n", buf);
++			}
++			diag_count++;
 +		}
 +		if (fWorker) {
 +			IOLockLock(fLock);
@@ -272,6 +296,18 @@ unrolled row loop, rows with the same source copied from the row above.
 +			IOLockUnlock(fLock);
 +		} else {
 +			present(fCopyRec);
++		}
++		if (surya_fb_mode >= 2) {
++			static unsigned diag_n;
++			diag_n++;
++			if (diag_n <= 30 || diag_n % 300 == 0) {
++				uint64_t wait_ns = 0, copy_ns = 0, now = mach_absolute_time();
++				absolutetime_to_nanoseconds(t_wait1 - t_wait0, &wait_ns);
++				absolutetime_to_nanoseconds(now - t_wait1, &copy_ns);
++				IOLog("SWEET FB: copy %u: line at swap %d, after wait %d (%llu us), after copy %d (%llu us)\n",
++				    diag_n, line_wait, line_start, (unsigned long long)(wait_ns / 1000ULL),
++				    surya_panel_line(), (unsigned long long)(copy_ns / 1000ULL));
++			}
 +		}
 +		IOLockLock(fLock);
 +		IOLockWakeup(fLock, &fDirty, false); /* SwapWait: the frame is on the panel */
@@ -336,7 +372,7 @@ unrolled row loop, rows with the same source copied from the row above.
  }
  
  void
-@@ -289,6 +513,37 @@
+@@ -289,6 +549,37 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -374,7 +410,7 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -302,14 +557,25 @@
+@@ -302,14 +593,25 @@
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -401,7 +437,7 @@ unrolled row loop, rows with the same source copied from the row above.
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -390,12 +656,96 @@
+@@ -390,12 +692,96 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -499,7 +535,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -542,10 +892,15 @@
+@@ -542,10 +928,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);
