@@ -10,15 +10,16 @@ processors, and one processor's PMCCNTR_EL0 against CNTVCT_EL0 while bound
 to it.
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -823,6 +823,7 @@
+@@ -823,6 +823,8 @@
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <vm/vm_shared_region.h>
  #include <arm/thread.h>
 +#include <arm/cpu_data_internal.h> /* surya: getCpuDatap()->cpu_base_timebase */
++#include <kern/timer.h>             /* surya: timer_grab for the sampler */
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1011,35 +1012,123 @@
+@@ -1011,35 +1013,130 @@
  	}
  	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
  
@@ -45,10 +46,18 @@ to it.
  		}
  		fp = get_saved_state_fp(ss);
 -		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
-+		t = tn++;
-+		printf("SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx\n", name, t,
- 		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
 -		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		t = tn++;
++		/* surya 23.10: the thread's CPU time so far (user, system; ns), to get
++		 * its busy share between samples; the saved pc is stale for a thread
++		 * that is running in user mode. */
++		uint64_t ut = 0, st = 0;
++		absolutetime_to_nanoseconds(timer_grab(&thread->user_timer), &ut);
++		absolutetime_to_nanoseconds(timer_grab(&thread->system_timer), &st);
++		printf("SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx cpu u=%llu s=%llu\n", name, t,
++		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss),
++		    (unsigned long long)ut, (unsigned long long)st);
 +		/*
 +		 * surya: the live USB log cuts lines near 250 bytes, which hid the
 +		 * callers. Up to 64 frames, 8 per line: "SMP name tN bt+K ...".
