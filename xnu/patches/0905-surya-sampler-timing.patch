@@ -14,7 +14,28 @@ sweetsampledelay and sweetsampleevery (seconds) replace the fixed 90 s and
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -64,17 +65,35 @@
+@@ -45,12 +46,20 @@
+ }
+ 
+ extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++extern void sweet_sample_task_cpu(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++static int sweet_sample_top;
+ 
+ static int
+ sweet_sample_proc(proc_t p, __unused void *arg)
+ {
+ 	char name[32];
+ 	proc_name(proc_pid(p), name, sizeof(name));
++	if (sweet_sample_top) {
++		task_t t = proc_task(p);
++		if (t != TASK_NULL) {
++			sweet_sample_task_cpu(name, proc_pid(p), t);
++		}
++	}
+ 	if (sweet_sample_wanted(name)) {
+ 		task_t task = proc_task(p);
+ 		if (task != TASK_NULL) {
+@@ -64,17 +73,36 @@
  sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	static int chan;
@@ -35,6 +56,7 @@ sweetsampledelay and sweetsampleevery (seconds) replace the fixed 90 s and
 +	/* surya 23.10: sweetsampleburst=N takes N samples 20 ms apart at every
 +	 * period (with sweetsamplet0=1, osfmk/kern/exception.c, only each task's
 +	 * first thread): where SpringBoard's main thread is while it scrolls. */
++	(void)PE_parse_boot_argn("sweetsampletop", &sweet_sample_top, sizeof(sweet_sample_top));
 +	int burst = 1;
 +	(void)PE_parse_boot_argn("sweetsampleburst", &burst, sizeof(burst));
 +	burst = burst < 1 ? 1 : (burst > 200 ? 200 : burst);

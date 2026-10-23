@@ -28,7 +28,32 @@ to it.
  
  /*
   * SWEET crash report on the console. The phone has no way to get crash
-@@ -1011,35 +1015,191 @@
+@@ -996,6 +1000,24 @@
+  */
+ void sweet_sample_task(const char *name, int pid, task_t task);
+ 
++/*
++ * surya 23.10, sweetsampletop=1: every process's CPU time so far (user,
++ * system; ns), once per sample, to see who uses the cores while the user
++ * scrolls (the cores were 92-98 % busy with suryafb=4, backboardd ~4.5 of
++ * them in shim-xr12: the rest was unaccounted for).
++ */
++void sweet_sample_task_cpu(const char *name, int pid, task_t task);
++
++void
++sweet_sample_task_cpu(const char *name, int pid, task_t task)
++{
++	struct recount_times_mach rtm = recount_task_times(task);
++	uint64_t u = 0, st = 0;
++	absolutetime_to_nanoseconds(rtm.rtm_user, &u);
++	absolutetime_to_nanoseconds(rtm.rtm_system, &st);
++	printf("SMPTOP %s[%d] u=%llu s=%llu\n", name, pid, (unsigned long long)u, (unsigned long long)st);
++}
++
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+ {
+@@ -1011,35 +1033,191 @@
  	}
  	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
  
