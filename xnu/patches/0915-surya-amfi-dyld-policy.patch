@@ -1,0 +1,70 @@
+surya: answer dyld's AMFI policy query
+
+dyld asks AMFI (__mac_syscall("AMFI", 0x5a)) what the process may do;
+without an answer it allows nothing and apps that load their own
+frameworks through @rpath (Books, Podcasts) die at launch. The built-in
+AMFI policy is now named "AMFI" and answers as AMFI does for an ordinary
+app: @-paths and classic fallback paths. Other AMFI calls still fail
+(ENOPOLICY) and are logged once.
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,50 @@
+ 	}
+ }
+ 
++/*
++ * surya 23.10: dyld asks AMFI what the new process may do (libamfi
++ * amfi_check_dyld_policy_self in /usr/lib/dyld: __mac_syscall("AMFI", 0x5a,
++ * {input flags, pointer to the output flags})). With no AMFI policy the call
++ * fails, dyld takes the output as 0 and allows nothing: apps that find their
++ * own frameworks through @rpath die at launch ("Library not loaded:
++ * @rpath/BKAudiobooks.framework ... security policy does not allow @ path
++ * expansion": Books, Podcasts). Answer as AMFI does for an ordinary app:
++ * @-paths and the classic fallback paths (dyld ProcessConfig::Security:
++ * bit 0 allowAtPaths, bit 3 allowClassicFallbackPaths); no DYLD_* variables,
++ * no interposing, no custom shared cache. Every other AMFI call fails as
++ * before (ENOPOLICY), and is logged once.
++ */
++#define SWEET_AMFI_CHECK_DYLD_POLICY_SELF       0x5a
++#define SWEET_AMFI_DYLD_ALLOW_AT_PATH           (1ULL << 0)
++#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    (1ULL << 3)
++
++static uint64_t sweet_amfi_calls_seen[4];
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY_SELF) {
++		if (call >= 0 && call < 256 &&
++		    !(sweet_amfi_calls_seen[call / 64] & (1ULL << (call % 64)))) {
++			sweet_amfi_calls_seen[call / 64] |= 1ULL << (call % 64);
++			char name[32];
++			proc_name(proc_pid(p), name, sizeof(name));
++			printf("SWEET AMFI: %s call 0x%x not handled\n", name, call);
++		}
++		return ENOPOLICY;
++	}
++	uint64_t args[2];               /* input flags, user pointer to the output flags */
++	int error = copyin(arg, args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	uint64_t out = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS;
++	return copyout(&out, (user_addr_t)args[1], sizeof(out));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +402,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",              /* __mac_syscall finds a policy by this name */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
