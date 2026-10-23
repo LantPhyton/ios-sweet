@@ -119,7 +119,28 @@ unrolled row loop, rows with the same source copied from the row above.
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
-@@ -176,6 +231,26 @@
+@@ -149,6 +204,20 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * surya 24.10, from awa-xaga/ios-enchilada a8cfac18d3 (topaz 0138, also
++ * qcom-toolbox 0087; confirmed on two phones). QuartzCore (CAMetalContextCreate, once per process) polls
++ * IOServiceMatching("IOAcceleratorES") 300 times, 100 ms apart, before it
++ * goes on: thirty seconds at every backboardd start. Publish an empty one;
++ * without MetalPluginName/ClassName Metal passes over it and the renderers
++ * stay as they are (the CPU path).
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -176,6 +245,26 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -146,7 +167,7 @@ unrolled row loop, rows with the same source copied from the row above.
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -195,7 +270,64 @@
+@@ -195,12 +284,80 @@
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -212,7 +233,23 @@ unrolled row loop, rows with the same source copied from the row above.
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -212,13 +344,31 @@
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	uint32_t accelOn = 1;
++	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (accel != NULL && accel->init()) {
++		accel->setName("sgx");
++		if (accel->attach(this)) {
++			accel->registerService();
++			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++		}
++	}
++	OSSafeReleaseNULL(accel);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -212,13 +369,31 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -245,7 +282,7 @@ unrolled row loop, rows with the same source copied from the row above.
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
  		IOMobileFramebufferUserClient *client =
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
-@@ -233,18 +383,27 @@
+@@ -233,18 +408,27 @@
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
@@ -277,7 +314,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
  		if (rec != NULL) {
  			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
-@@ -256,7 +415,194 @@
+@@ -256,7 +440,194 @@
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
  	}
@@ -473,7 +510,7 @@ unrolled row loop, rows with the same source copied from the row above.
  }
  
  void
-@@ -289,6 +635,37 @@
+@@ -289,6 +660,37 @@
  static uint32_t sweet_fb_swaps_logged;
  static uint64_t sweet_fb_swap_count;
  
@@ -511,7 +548,7 @@ unrolled row loop, rows with the same source copied from the row above.
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
  /*
   * A swap only records the frame: copying 10 MB into the panel on every
-@@ -299,17 +676,35 @@
+@@ -299,17 +701,35 @@
  void
  AppleCLCD::swap(const uint8_t *rec)
  {
@@ -548,7 +585,7 @@ unrolled row loop, rows with the same source copied from the row above.
  {
  	uint32_t mask = get32(rec, 0x104);
  
-@@ -390,12 +785,96 @@
+@@ -390,12 +810,96 @@
  		    s->memory == NULL || last > s->memory->getLength()) {
  			src = 0;
  		}
@@ -647,7 +684,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		}
  		s->release();
  	}
-@@ -499,6 +978,7 @@
+@@ -499,6 +1003,7 @@
  			break;
  		}
  		memcpy(rec, args->structureInput, sizeof(rec));
@@ -655,7 +692,7 @@ unrolled row loop, rows with the same source copied from the row above.
  		fFB->swap(rec);
  		break;
  	}
-@@ -542,10 +1022,15 @@
+@@ -542,10 +1047,15 @@
  				fFB->fDirty = true;     /* on: redraw the latest frame */
  			}
  			IOLockUnlock(fFB->fLock);

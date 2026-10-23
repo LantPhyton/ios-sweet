@@ -20,7 +20,15 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
  #include <kern/startup.h>
  #include <libkern/amfi/amfi.h>
  #include <mach/kern_return.h>
-@@ -279,14 +282,161 @@
+@@ -35,6 +38,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <IOKit/IOBSD.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -279,14 +283,161 @@
   * launchd reports mach lookups as "error = 159: Sandbox restriction"
   * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
   * "profile not found"). SWEET runs without a sandbox: operations succeed
@@ -144,8 +152,7 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
 +#define SWEET_MOBILE_UID        501
 +#define SWEET_MOBILE_HOME       "/private/var/mobile"
 +
- static int
--sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++static int
 +sweet_sandbox_container_path(struct proc *caller, user_addr_t arg)
 +{
 +	struct sweet_sandbox_container_args args;
@@ -181,12 +188,13 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
 +	return copyout(SWEET_MOBILE_HOME, args.buf, sizeof(SWEET_MOBILE_HOME));
 +}
 +
-+static int
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
 +sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  {
  	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
  		sweet_sandbox_seen |= 1ULL << call;
-@@ -295,9 +445,12 @@
+@@ -295,9 +446,12 @@
  		printf("SWEET Sandbox: %s op %d\n", name, call);
  	}
  	switch (call) {
@@ -200,7 +208,7 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
  	case 0x43:      /* container expected */
  		return ENOENT;
  	default:
-@@ -305,8 +458,66 @@
+@@ -305,8 +459,77 @@
  	}
  }
  
@@ -232,6 +240,16 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
 +#define SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF      0x86ULL
 +#define SWEET_AMFI_DYLD_ALLOW_AT_PATH           (1ULL << 0)
 +#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    (1ULL << 3)
++/*
++ * surya 24.10, from anonbeat1/ios-sweet 6ebeb7d14d and 12e0772540: bit 8 is
++ * read by libsystem_trace (_os_trace_init_slow) as "development environment
++ * variables allowed" — without it OS_ACTIVITY_DT_MODE is ignored (our
++ * sweetoslog= printed nothing in shim-xr18); bit 1 lets dyld honour DYLD_*
++ * path variables (DYLD_INSERT_LIBRARIES), which the GPU userland of other
++ * ports needs.
++ */
++#define SWEET_AMFI_DYLD_ALLOW_PATH_VARS         (1ULL << 1)
++#define SWEET_AMFI_DYLD_ALLOW_DEV_ENV_VARS      (1ULL << 8)
 +
 +static uint64_t sweet_amfi_calls_seen[4];
 +
@@ -257,7 +275,8 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
 +	if (error) {
 +		return error;
 +	}
-+	uint64_t out = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS;
++	uint64_t out = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS |
++	    SWEET_AMFI_DYLD_ALLOW_PATH_VARS | SWEET_AMFI_DYLD_ALLOW_DEV_ENV_VARS;
 +	return copyout(&out, (user_addr_t)args[1], sizeof(out));
 +}
 +
@@ -267,7 +286,43 @@ and 0102. Other AMFI calls still fail (ENOPOLICY) and are logged once.
  };
  
  /*
-@@ -360,7 +571,7 @@
+@@ -323,12 +546,35 @@
+ } sweet_priv_logged[SWEET_PRIV_LOG_MAX];
+ static int sweet_priv_logged_count;
+ 
++/*
++ * surya 24.10, from edadras/ios-sweet 38e1d5ca25 (checked in QEMU there):
++ * what Sandbox grants for an entitlement on iOS (WebKit networking, NECP
++ * clients). Our log: privileges 10001 and 10003 denied to dasd, cloudd,
++ * symptomsd and others.
++ */
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_priv_entitlements[] = {
++	{ PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, "com.apple.private.network.socket-delegate" },
++	{ PRIV_NET_PRIVILEGED_NECP_MATCH, "com.apple.private.necp.match" },
++	{ PRIV_NET_PRIVILEGED_NECP_POLICIES, "com.apple.private.necp.policies" },
++	{ PRIV_NET_PRIVILEGED_TRAFFIC_CLASS, "com.apple.private.network.traffic-class" },
++	{ PRIV_NET_PRIVILEGED_NETWORK_STATISTICS, "com.apple.private.network.statistics" },
++};
++
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	for (size_t i = 0; i < sizeof(sweet_priv_entitlements) / sizeof(sweet_priv_entitlements[0]); i++) {
++		if (sweet_priv_entitlements[i].priv == priv &&
++		    IOCurrentTaskHasEntitlement(sweet_priv_entitlements[i].entitlement)) {
++			return 0;
++		}
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {
+@@ -360,7 +606,7 @@
  static mac_policy_handle_t sweet_sandbox_mac_handle;
  
  static struct mac_policy_conf sweet_amfi_mac_conf = {

@@ -1,0 +1,19 @@
+surya: pmap_sync_page_attributes_phys widens the page number
+
+From Log1nYT/ios-sweet 9b745f24b3 (also DC28088 9de2ec6375, localhosts-A
+8fc0413bea): (pp << PAGE_SHIFT) is computed in 32 bits, so every page at
+or above 4 GiB was flushed at the wrong address.
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..c343bd6 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,8 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* pp is 32 bits wide: widen before shifting, or every page at or above 4 GiB (pp >= 2^18 with 16K pages) flushes the wrong page */
++	flush_dcache((vm_offset_t) ((uint64_t)pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP

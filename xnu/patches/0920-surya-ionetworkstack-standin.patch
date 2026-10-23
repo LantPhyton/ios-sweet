@@ -1,0 +1,28 @@
+surya: IONetworkStack stand-in
+
+From sashinovsky/ios-bittery 364c7efa43 (confirmed on Pixel 3; qcom-toolbox
+0111: the first process that lists interfaces no longer waits 300 s).
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -58,6 +58,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
+     "   {"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IONetworkStack;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetNetworkStack.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
