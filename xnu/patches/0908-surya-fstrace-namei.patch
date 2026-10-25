@@ -516,7 +516,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +		case 4:
 +			/* only below /private/var/: user data, never the system volume */
 +			what = "rmtree";
-+			if (strncmp(path, "/private/var/", 13) != 0 || strstr(path, "/..") != NULL) {
++			if (strncmp(path, "/private/var/", 13) != 0 || strnstr(path, "/..", MAXPATHLEN) != NULL) {
 +				error = EPERM;
 +				break;
 +			}
