@@ -6,7 +6,7 @@ executables at exec, so libsystem_trace copies their os_log messages to
 stderr; sweetnull= forwards that to the console and the USB live log.
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5741,6 +5741,65 @@
+@@ -5741,6 +5741,67 @@
  		imgp->ip_envc++;
  	}
  
@@ -36,6 +36,8 @@ stderr; sweetnull= forwards that to the console and the USB live log.
 +			extern void sweet_ls_reset(void);
 +			ls_reset_done = 1;
 +			sweet_ls_reset();
++			extern void sweet_wall_reset(void);
++			sweet_wall_reset();
 +		}
 +		const char *base = strrchr(path, '/');
 +		base = base ? base + 1 : path;

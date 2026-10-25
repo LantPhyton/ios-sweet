@@ -6,7 +6,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 "FS name[pid] namei op N path -> error".
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -162,6 +162,185 @@
+@@ -162,6 +162,217 @@
   *		lookup: ???
   *		VNOP_READLINK:???
   */
@@ -177,6 +177,38 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +	}
 +}
 +
++/*
++ * surya 25.10: boot-arg sweetwallreset=1 deletes the legacy wallpaper files
++ * /private/var/mobile/Library/SpringBoard/{Lock,Home}Background{.cpbitmap,.jpg,
++ * Thumbnail.jpg} before launchd starts. Root v3 (23.10) put a JPEG there,
++ * also under the .cpbitmap name (a raw Apple format). Once app extensions ran
++ * (shim-xr22), LegacyPoster used them and PaperBoardUI's snapshot of that
++ * poster got no CGImage: SpringBoard died in _UIImageGetCGImageRepresentation
++ * (-[PBUIImageEncoder saveUIImage:error:]) every few seconds. One-shot.
++ */
++void sweet_wall_reset(void);
++
++void
++sweet_wall_reset(void)
++{
++	static const char *const files[] = {
++		"/private/var/mobile/Library/SpringBoard/LockBackground.cpbitmap",
++		"/private/var/mobile/Library/SpringBoard/LockBackground.jpg",
++		"/private/var/mobile/Library/SpringBoard/LockBackgroundThumbnail.jpg",
++		"/private/var/mobile/Library/SpringBoard/HomeBackground.cpbitmap",
++		"/private/var/mobile/Library/SpringBoard/HomeBackground.jpg",
++		"/private/var/mobile/Library/SpringBoard/HomeBackgroundThumbnail.jpg",
++	};
++	uint32_t on = 0;
++	if (!PE_parse_boot_argn("sweetwallreset", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++		int error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(files[i]), UIO_SYSSPACE, 0);
++		printf("SWEET WALL: unlink %s -> %d\n", files[i], error);
++	}
++}
++
 +static void
 +sweet_fstrace_namei(struct nameidata *ndp, proc_t p, int error)
 +{
@@ -192,7 +224,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  int
  namei(struct nameidata *ndp)
  {
-@@ -493,6 +672,9 @@
+@@ -493,6 +704,9 @@
  				}
  			}
  
@@ -202,7 +234,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  			return 0;
  		}
  
-@@ -529,6 +711,9 @@
+@@ -529,6 +743,9 @@
  		vnode_put(ndp->ni_vp);
  	}
  error_out:
