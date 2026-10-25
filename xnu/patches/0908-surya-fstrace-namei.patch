@@ -6,7 +6,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 "FS name[pid] namei op N path -> error".
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -162,6 +162,602 @@
+@@ -162,6 +162,603 @@
   *		lookup: ???
   *		VNOP_READLINK:???
   */
@@ -79,7 +79,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +#define SWEET_LS_CONTAINERS     "/private/var/mobile/Containers/Data/InternalDaemon"
 +#define SWEET_LS_MAX_NAMES      64
 +
-+/* Names in a directory (no dot entries), at most max, each up to 255 bytes. */
++/* Names in a directory (all but . and ..), at most max, each up to 255 bytes. */
 +static int
 +sweet_dir_names(const char *dir, char (*names)[256], int max, int *count)
 +{
@@ -118,7 +118,8 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +			if (de->d_reclen == 0) {
 +				break;
 +			}
-+			if (de->d_ino != 0 && de->d_namlen > 0 && de->d_name[0] != '.') {
++			if (de->d_ino != 0 && de->d_namlen > 0 &&
++			    !(de->d_name[0] == '.' && (de->d_namlen == 1 || (de->d_namlen == 2 && de->d_name[1] == '.')))) {	/* every name but . and .. (25.10: hidden files left directories not empty) */
 +				size_t n = MIN((size_t)de->d_namlen, (size_t)255);
 +				memcpy(names[*count], de->d_name, n);
 +				names[*count][n] = '\0';
@@ -609,7 +610,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  int
  namei(struct nameidata *ndp)
  {
-@@ -493,6 +1089,9 @@
+@@ -493,6 +1090,9 @@
  				}
  			}
  
@@ -619,7 +620,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  			return 0;
  		}
  
-@@ -529,6 +1128,9 @@
+@@ -529,6 +1129,9 @@
  		vnode_put(ndp->ni_vp);
  	}
  error_out:
