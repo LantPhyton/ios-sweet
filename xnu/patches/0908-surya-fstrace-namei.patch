@@ -6,12 +6,13 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 "FS name[pid] namei op N path -> error".
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -162,6 +162,217 @@
+@@ -162,6 +162,447 @@
   *		lookup: ???
   *		VNOP_READLINK:???
   */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <pexpert/pexpert.h>
++#include <sys/fcntl.h>
 +#include <sys/uio.h>
 +#include <sys/dirent.h>
 +/*
@@ -186,6 +187,235 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 + * poster got no CGImage: SpringBoard died in _UIImageGetCGImageRepresentation
 + * (-[PBUIImageEncoder saveUIImage:error:]) every few seconds. One-shot.
 + */
++/*
++ * surya 25.10: files the boot image carries for the iOS root (mkpayload.py
++ * --files MANIFEST; idea from the spes and sunstone ports, written anew):
++ * changing the root no longer needs a 10-minute userdata flash, only
++ * `fastboot boot`. The archive is at /chosen/memory-map "SuryaFiles" =
++ * <phys, size>, installed once launchd is about to start (kern_exec.c):
++ *   char magic[8] = "SURYAFS1"; u32 version = 1, count;
++ *   count x { u32 op, mode, uid, gid, path_len (with NUL), pad; u64 size;
++ *             path, data — each padded to 8 bytes }
++ *   op 1: put a file (written only when missing or different; the size is
++ *         set exactly afterwards — vnode_open with O_TRUNC does not always
++ *         truncate, which corrupted a launchd.plist in another port);
++ *   op 2: delete a file; op 3: make a directory.
++ * Parent directories of a put are made as needed (mode 0755, root:wheel).
++ * Owner and mode are set on every put and mkdir. Boot-arg suryafiles=0 skips.
++ */
++#include <pexpert/device_tree.h>
++extern uint64_t phystokv(uint64_t pa);          /* osfmk/arm/pmap (vm_map_address_t, pmap_paddr_t) */
++void surya_files_install(void);
++
++#define SURYA_FILES_CHUNK       65536u
++
++static int
++surya_mkdir(const char *path, uint32_t mode, vfs_context_t ctx)
++{
++	struct nameidata nd;
++	struct vnode_attr va;
++	vnode_t vp, dvp;
++
++	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT | AUDITVNPATH1, UIO_SYSSPACE,
++	    CAST_USER_ADDR_T(path), ctx);
++	nd.ni_cnd.cn_flags |= WILLBEDIR;
++	int error = namei(&nd);
++	if (error) {
++		return error;
++	}
++	dvp = nd.ni_dvp;
++	vp = nd.ni_vp;
++	if (vp == NULLVP) {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_type, VDIR);
++		VATTR_SET(&va, va_mode, mode & 07777);
++		error = vn_create(dvp, &vp, &nd, &va, 0, 0, NULL, ctx);
++	} else {
++		error = EEXIST;
++	}
++	nameidone(&nd);
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	vnode_put(dvp);
++	return error;
++}
++
++static void
++surya_mkparents(const char *path, vfs_context_t ctx)
++{
++	char *dir = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (dir == NULL) {
++		return;
++	}
++	size_t len = strnlen(path, MAXPATHLEN - 1);
++	for (size_t i = 1; i < len; i++) {
++		if (path[i] == '/') {
++			memcpy(dir, path, i);
++			dir[i] = '\0';
++			(void)surya_mkdir(dir, 0755, ctx);      /* EEXIST for those that are there */
++		}
++	}
++	kfree_data(dir, MAXPATHLEN);
++}
++
++static int
++surya_set_owner(const char *path, uint32_t mode, uint32_t uid, uint32_t gid, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & 07777);
++	VATTR_SET(&va, va_uid, uid);
++	VATTR_SET(&va, va_gid, gid);
++	error = vnode_setattr(vp, &va, ctx);
++	vnode_put(vp);
++	return error;
++}
++
++static bool
++surya_same(const char *path, const uint8_t *data, uint64_t size, vfs_context_t ctx, uint8_t *buf)
++{
++	vnode_t vp = NULLVP;
++	off_t cur = 0;
++	if (vnode_open(path, FREAD, 0, 0, &vp, ctx) != 0) {
++		return false;
++	}
++	bool same = vnode_size(vp, &cur, ctx) == 0 && (uint64_t)cur == size;
++	for (uint64_t off = 0; same && off < size; off += SURYA_FILES_CHUNK) {
++		int n = (int)MIN((uint64_t)SURYA_FILES_CHUNK, size - off), resid = 0;
++		if (vn_rdwr(UIO_READ, vp, (caddr_t)buf, n, (off_t)off, UIO_SYSSPACE, IO_NODELOCKED,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) != 0 || resid != 0 ||
++		    memcmp(buf, data + off, (size_t)n) != 0) {
++			same = false;
++		}
++	}
++	(void)vnode_close(vp, FREAD, ctx);
++	return same;
++}
++
++static int
++surya_put(const char *path, const uint8_t *data, uint64_t size, vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++	surya_mkparents(path, ctx);
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE, 0644, 0, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	for (uint64_t off = 0; error == 0 && off < size; off += SURYA_FILES_CHUNK) {
++		int n = (int)MIN((uint64_t)SURYA_FILES_CHUNK, size - off), resid = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(data + off), n, (off_t)off,
++		    UIO_SYSSPACE, IO_NODELOCKED | IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++	}
++	if (error == 0) {
++		error = vnode_setsize(vp, (off_t)size, IO_SYNC, ctx);
++	}
++	(void)vnode_close(vp, FWRITE, ctx);
++	return error;
++}
++
++void
++surya_files_install(void)
++{
++	DTEntry entry;
++	void const *prop = NULL;
++	unsigned int prop_size = 0;
++	uint32_t on = 1;
++
++	(void)PE_parse_boot_argn("suryafiles", &on, sizeof(on));
++	if (!on || SecureDTLookupEntry(NULL, "/chosen/memory-map", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "SuryaFiles", &prop, &prop_size) != kSuccess || prop_size < 16) {
++		return;
++	}
++	uint64_t pa = ((const uint64_t *)prop)[0], len = ((const uint64_t *)prop)[1];
++	const uint8_t *base = (const uint8_t *)(uintptr_t)phystokv(pa), *end = base + len;
++	if (len < 16 || memcmp(base, "SURYAFS1", 8) != 0 || *(const uint32_t *)(base + 8) != 1) {
++		printf("SURYA FILES: bad archive at 0x%llx (%llu bytes)\n", pa, len);
++		return;
++	}
++	uint32_t count = *(const uint32_t *)(base + 12);
++	const uint8_t *p = base + 16;
++	vfs_context_t ctx = vfs_context_kernel();
++	uint8_t *buf = kalloc_data(SURYA_FILES_CHUNK, Z_WAITOK);
++	unsigned done = 0, kept = 0, failed = 0;
++
++	for (uint32_t i = 0; i < count && buf != NULL; i++) {
++		if (end - p < 32) {
++			printf("SURYA FILES: archive ends early at entry %u\n", i);
++			break;
++		}
++		const uint32_t *h = (const uint32_t *)p;
++		uint32_t op = h[0], mode = h[1], uid = h[2], gid = h[3], path_len = h[4];
++		uint64_t size = *(const uint64_t *)(p + 24);
++		const char *path = (const char *)(p + 32);
++		const uint8_t *data = p + 32 + ((path_len + 7u) & ~7u);
++		if (path_len < 2 || path_len > 1023 || path[path_len - 1] != '\0' || path[0] != '/' ||
++		    data > end || (uint64_t)(end - data) < size) {
++			printf("SURYA FILES: entry %u malformed; stopping\n", i);
++			break;
++		}
++		p = data + ((size + 7u) & ~7ull);
++		int error = 0;
++		const char *what = "?";
++		switch (op) {
++		case 1:
++			if (surya_same(path, data, size, ctx, buf)) {
++				kept++;
++				(void)surya_set_owner(path, mode, uid, gid, ctx);
++				continue;
++			}
++			what = "put";
++			error = surya_put(path, data, size, ctx);
++			if (error == 0) {
++				error = surya_set_owner(path, mode, uid, gid, ctx);
++			}
++			break;
++		case 2:
++			what = "rm";
++			error = unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++			if (error == ENOENT) {
++				kept++;
++				continue;
++			}
++			break;
++		case 3:
++			what = "mkdir";
++			surya_mkparents(path, ctx);
++			error = surya_mkdir(path, mode, ctx);
++			if (error == EEXIST) {
++				error = 0;
++			}
++			if (error == 0) {
++				error = surya_set_owner(path, mode, uid, gid, ctx);
++			}
++			break;
++		default:
++			printf("SURYA FILES: entry %u: unknown op %u\n", i, op);
++			failed++;
++			continue;
++		}
++		printf("SURYA FILES: %s %s (%llu bytes, %o %u:%u) -> %d\n", what, path,
++		    (unsigned long long)size, mode, uid, gid, error);
++		if (error) {
++			failed++;
++		} else {
++			done++;
++		}
++	}
++	if (buf != NULL) {
++		kfree_data(buf, SURYA_FILES_CHUNK);
++	}
++	printf("SURYA FILES: %u done, %u unchanged, %u failed (of %u)\n", done, kept, failed, count);
++}
++
 +void sweet_wall_reset(void);
 +
 +void
@@ -224,7 +454,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  int
  namei(struct nameidata *ndp)
  {
-@@ -493,6 +704,9 @@
+@@ -493,6 +934,9 @@
  				}
  			}
  
@@ -234,7 +464,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  			return 0;
  		}
  
-@@ -529,6 +743,9 @@
+@@ -529,6 +973,9 @@
  		vnode_put(ndp->ni_vp);
  	}
  error_out:
