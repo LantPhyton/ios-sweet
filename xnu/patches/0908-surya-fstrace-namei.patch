@@ -6,7 +6,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 "FS name[pid] namei op N path -> error".
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -162,6 +162,586 @@
+@@ -162,6 +162,602 @@
   *		lookup: ???
   *		VNOP_READLINK:???
   */
@@ -368,6 +368,9 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +	vnode_put(vp);
 +	if (!dir) {
 +		error = unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++		if (error) {
++			printf("SURYA FILES: rmtree: unlink %s -> %d\n", path, error);
++		}
 +		*count += error == 0;
 +		return error;
 +	}
@@ -380,8 +383,15 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +		error = ENOMEM;
 +		goto out;
 +	}
++	/*
++	 * 25.10: a pass repeats only while it still removes something (a
++	 * directory holds more names than one listing returns); before, an entry
++	 * that could not be removed made every level repeat 64 times — the
++	 * repeats multiplied with the depth and the boot hung (shim-xr27).
++	 */
 +	for (int pass = 0; pass < 64; pass++) {
 +		int n = 0;
++		unsigned before = *count;
 +		(void)sweet_dir_names(path, names, SURYA_TREE_NAMES, &n);
 +		if (n == 0) {
 +			break;
@@ -390,8 +400,14 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +			snprintf(child, MAXPATHLEN, "%s/%s", path, names[i]);
 +			(void)surya_rmtree(child, depth + 1, ctx, count);
 +		}
++		if (*count == before || n < SURYA_TREE_NAMES) {
++			break;
++		}
 +	}
 +	error = surya_rmdir(path, ctx);
++	if (error) {
++		printf("SURYA FILES: rmtree: rmdir %s -> %d\n", path, error);
++	}
 +	*count += error == 0;
 +out:
 +	if (names != NULL) {
@@ -593,7 +609,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  int
  namei(struct nameidata *ndp)
  {
-@@ -493,6 +1073,9 @@
+@@ -493,6 +1089,9 @@
  				}
  			}
  
@@ -603,7 +619,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  			return 0;
  		}
  
-@@ -529,6 +1112,9 @@
+@@ -529,6 +1128,9 @@
  		vnode_put(ndp->ni_vp);
  	}
  error_out:
