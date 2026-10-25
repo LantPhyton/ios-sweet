@@ -149,6 +149,8 @@ def pack_files(manifest):
       put   SRC  /dest/path  [mode=644] [uid=0] [gid=0]
       rm    /dest/path
       mkdir /dest/path       [mode=755] [uid=0] [gid=0]
+      rmtree /private/var/... (a whole directory; only below /private/var/)
+      ls    /path [depth=3]  (prints the tree into the kernel log)
     Entry: u32 op (1 put, 2 rm, 3 mkdir), mode, uid, gid, path_len (with NUL), pad;
     u64 size; path, data, each padded to 8 bytes.
     """
@@ -167,6 +169,10 @@ def pack_files(manifest):
             entries.append((1, mode, uid, gid, dst, data))
         elif op == 'rm':
             entries.append((2, 0, 0, 0, w[1], b''))
+        elif op == 'rmtree':
+            entries.append((4, 0, 0, 0, w[1], b''))
+        elif op == 'ls':
+            entries.append((5, int(w[2]) if len(w) > 2 else 3, 0, 0, w[1], b''))
         elif op == 'mkdir':
             mode, uid, gid = int(w[2], 8) if len(w) > 2 else 0o755, int(w[3]) if len(w) > 3 else 0, int(w[4]) if len(w) > 4 else 0
             entries.append((3, mode, uid, gid, w[1], b''))

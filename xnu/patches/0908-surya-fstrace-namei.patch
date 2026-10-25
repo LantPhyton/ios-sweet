@@ -6,7 +6,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 "FS name[pid] namei op N path -> error".
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
-@@ -162,6 +162,447 @@
+@@ -162,6 +162,586 @@
   *		lookup: ???
   *		VNOP_READLINK:???
   */
@@ -199,7 +199,9 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 + *   op 1: put a file (written only when missing or different; the size is
 + *         set exactly afterwards — vnode_open with O_TRUNC does not always
 + *         truncate, which corrupted a launchd.plist in another port);
-+ *   op 2: delete a file; op 3: make a directory.
++ *   op 2: delete a file; op 3: make a directory; op 4: delete a directory
++ *         tree (only below /private/var/); op 5: print a tree into the log
++ *         (mode = depth, default 3).
 + * Parent directories of a put are made as needed (mode 0755, root:wheel).
 + * Owner and mode are set on every put and mkdir. Boot-arg suryafiles=0 skips.
 + */
@@ -322,6 +324,120 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +	return error;
 +}
 +
++/* op 4 (rmtree) and op 5 (list): directories, walked with sweet_dir_names (readdir). */
++static int
++surya_rmdir(const char *path, vfs_context_t ctx)
++{
++	struct nameidata nd;
++	NDINIT(&nd, DELETE, OP_RMDIR, LOCKPARENT | AUDITVNPATH1, UIO_SYSSPACE,
++	    CAST_USER_ADDR_T(path), ctx);
++	int error = namei(&nd);
++	if (error) {
++		return error;
++	}
++	vnode_t vp = nd.ni_vp, dvp = nd.ni_dvp;
++	if (vp == NULLVP) {
++		error = ENOENT;
++	} else if (vnode_vtype(vp) != VDIR) {
++		error = ENOTDIR;
++	} else if (vp == dvp || vnode_isvroot(vp)) {
++		error = EBUSY;
++	} else {
++		error = VNOP_RMDIR(dvp, vp, &nd.ni_cnd, ctx);
++	}
++	nameidone(&nd);
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	vnode_put(dvp);
++	return error;
++}
++
++#define SURYA_TREE_NAMES        256
++
++/* Delete everything under path, then path; depth-first, at most 16 levels. */
++static int
++surya_rmtree(const char *path, int depth, vfs_context_t ctx, unsigned *count)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	bool dir = vnode_vtype(vp) == VDIR;
++	vnode_put(vp);
++	if (!dir) {
++		error = unlink1(ctx, NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++		*count += error == 0;
++		return error;
++	}
++	if (depth > 16) {
++		return ELOOP;
++	}
++	char (*names)[256] = kalloc_data(SURYA_TREE_NAMES * 256, Z_WAITOK);
++	char *child = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (names == NULL || child == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	for (int pass = 0; pass < 64; pass++) {
++		int n = 0;
++		(void)sweet_dir_names(path, names, SURYA_TREE_NAMES, &n);
++		if (n == 0) {
++			break;
++		}
++		for (int i = 0; i < n; i++) {
++			snprintf(child, MAXPATHLEN, "%s/%s", path, names[i]);
++			(void)surya_rmtree(child, depth + 1, ctx, count);
++		}
++	}
++	error = surya_rmdir(path, ctx);
++	*count += error == 0;
++out:
++	if (names != NULL) {
++		kfree_data(names, SURYA_TREE_NAMES * 256);
++	}
++	if (child != NULL) {
++		kfree_data(child, MAXPATHLEN);
++	}
++	return error;
++}
++
++/* Print the tree under path (names, sizes) into the log; at most depth levels. */
++static void
++surya_list(const char *path, int depth, int max_depth, vfs_context_t ctx, unsigned *lines)
++{
++	vnode_t vp = NULLVP;
++	if (*lines > 400 || vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0) {
++		return;
++	}
++	bool dir = vnode_vtype(vp) == VDIR;
++	off_t size = 0;
++	(void)vnode_size(vp, &size, ctx);
++	vnode_put(vp);
++	printf("SURYA FILES: ls %s%s (%lld)\n", path, dir ? "/" : "", (long long)size);
++	(*lines)++;
++	if (!dir || depth >= max_depth) {
++		return;
++	}
++	char (*names)[256] = kalloc_data(SURYA_TREE_NAMES * 256, Z_WAITOK);
++	char *child = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	int n = 0;
++	if (names != NULL && child != NULL) {
++		(void)sweet_dir_names(path, names, SURYA_TREE_NAMES, &n);
++		for (int i = 0; i < n; i++) {
++			snprintf(child, MAXPATHLEN, "%s/%s", path, names[i]);
++			surya_list(child, depth + 1, max_depth, ctx, lines);
++		}
++	}
++	if (names != NULL) {
++		kfree_data(names, SURYA_TREE_NAMES * 256);
++	}
++	if (child != NULL) {
++		kfree_data(child, MAXPATHLEN);
++	}
++}
++
 +void
 +surya_files_install(void)
 +{
@@ -397,6 +513,29 @@ prints every lookup of a process named in boot-arg sweetfstrace:
 +				error = surya_set_owner(path, mode, uid, gid, ctx);
 +			}
 +			break;
++		case 4:
++			/* only below /private/var/: user data, never the system volume */
++			what = "rmtree";
++			if (strncmp(path, "/private/var/", 13) != 0 || strstr(path, "/..") != NULL) {
++				error = EPERM;
++				break;
++			}
++			{
++				unsigned removed = 0;
++				error = surya_rmtree(path, 0, ctx, &removed);
++				printf("SURYA FILES: rmtree %s: %u removed\n", path, removed);
++			}
++			if (error == ENOENT) {
++				kept++;
++				continue;
++			}
++			break;
++		case 5:
++			{
++				unsigned lines = 0;
++				surya_list(path, 0, (int)(mode ? mode : 3), ctx, &lines);
++			}
++			continue;
 +		default:
 +			printf("SURYA FILES: entry %u: unknown op %u\n", i, op);
 +			failed++;
@@ -454,7 +593,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  int
  namei(struct nameidata *ndp)
  {
-@@ -493,6 +934,9 @@
+@@ -493,6 +1073,9 @@
  				}
  			}
  
@@ -464,7 +603,7 @@ prints every lookup of a process named in boot-arg sweetfstrace:
  			return 0;
  		}
  
-@@ -529,6 +973,9 @@
+@@ -529,6 +1112,9 @@
  		vnode_put(ndp->ni_vp);
  	}
  error_out:
