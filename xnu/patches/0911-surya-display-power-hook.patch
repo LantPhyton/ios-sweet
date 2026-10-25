@@ -237,7 +237,7 @@ unrolled row loop, rows with the same source copied from the row above.
  	fClients = OSArray::withCapacity(4);
 -	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
 -	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
-+	MiniIOSurfaceStart(getPlatform());     /* the IOSurface root (IOCoreSurfaceRoot) */
++	MiniIOSurfaceStart(getResourceService()); /* the IOSurface root (IOCoreSurfaceRoot), on IOResources as before */
 +	fPixels = surya_map_phys(fPhys, round_page((uint64_t)fRowBytes * fHeight), &fPanelMap);
 +	fDefaultSurface = MiniIOSurfaceCreateSimple(fLogicalW, fLogicalH, SWEET_FB_FORMAT_BGRA);
  	fWorkLoop = IOWorkLoop::workLoop();
